@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/mnt/d/optimized_cfg/cpp_impl/build",
+  "command": "/usr/bin/c++ -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/usr/lib/llvm-18/include -I/mnt/d/optimized_cfg/cpp_impl -std=gnu++17 -o CMakeFiles/cfg_tool.dir/main.cpp.o -c /mnt/d/optimized_cfg/cpp_impl/main.cpp",
+  "file": "/mnt/d/optimized_cfg/cpp_impl/main.cpp",
+  "output": "CMakeFiles/cfg_tool.dir/main.cpp.o"
+}
+]

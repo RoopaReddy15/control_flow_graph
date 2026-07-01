@@ -1,0 +1,440 @@
+================================================================================
+  VIVA QUESTIONS — C++ CFG PIPELINE IMPLEMENTATION
+  Comprehensive Q&A for Project Defense
+================================================================================
+
+================================================================================
+SECTION 1: PROJECT OVERVIEW & ARCHITECTURE
+================================================================================
+
+Q1: What does this project do in one sentence?
+A:  It takes raw C source code, parses it into an AST using Clang, builds a
+    Control Flow Graph, performs static dataflow analysis, applies iterative
+    optimizations, runs security taint analysis, and detects loops — all
+    implemented in C++17 with the LLVM/Clang toolchain.
+
+Q2: Why did you choose LLVM/Clang over pycparser?
+A:  Clang is a production-grade C frontend that handles the full C standard
+    (macros, typedefs, includes) correctly. pycparser needs fake headers and
+    has limited support. Clang also gives us accurate type info and source
+    locations. The project spec lists this as "Option A" — the harder but
+    more robust approach.
+
+Q3: Why is the project split into header-only files (.h) instead of .h + .cpp?
+A:  For a project of this size, header-only is simpler — no separate
+    compilation units, no linker issues with templates. The Clang API uses
+    heavy templates, so headers avoid instantiation problems. In production,
+    we'd split into .h/.cpp for faster recompilation.
+
+Q4: Explain the pipeline phases.
+A:  Phase 1 (Foundation): C source → Clang AST → CFG with basic blocks.
+    Phase 2 (Analysis):   Reaching Definitions (forward) + Live Variables (backward).
+    Phase 3 (Optimization): Constant folding, propagation, branch pruning,
+                            dead code elimination, unreachable removal, empty merging.
+    Bonus: Taint analysis, dominator trees, loop detection, LICM suggestions.
+
+Q5: What is a Basic Block?
+A:  A maximal sequence of instructions with one entry point (no jumps into the
+    middle) and one exit point (no jumps out except at the end). Control flow
+    only enters at the top and leaves at the bottom.
+
+Q6: What are ENTRY and EXIT blocks?
+A:  Sentinel blocks that represent the function's start and end. ENTRY has no
+    predecessors; EXIT has no successors. They simplify analysis by giving
+    every path a defined start and end point.
+
+================================================================================
+SECTION 2: INTERMEDIATE REPRESENTATION (ir.h)
+================================================================================
+
+Q7: Why do you need a custom IR instead of working directly with Clang AST?
+A:  The Clang AST is immutable and deeply tied to Clang's internal data
+    structures. Our IR is lightweight, mutable, and owned by us — we can
+    freely modify expressions during optimization (folding, propagation)
+    without dealing with Clang's memory management.
+
+Q8: Why use shared_ptr<Expr> for expressions?
+A:  Expressions form trees (BinOp has left/right children). shared_ptr
+    provides automatic memory management and enables safe sharing of
+    sub-expressions. The clone() method creates deep copies when needed.
+
+Q9: How does getDefs() vs getUses() work?
+A:  getDefs() returns the set of variables DEFINED (written to) by an
+    instruction — only ASSIGN and DECL_ASSIGN produce defs (the LHS).
+    getUses() returns variables READ by the instruction — from RHS
+    expressions, conditions, return values, function arguments, etc.
+
+Q10: What is the UNKNOWN expression kind for?
+A:  It's a fallback for C constructs we don't fully model (array subscripts,
+    conditional expressions, string literals). We store the pretty-printed
+    text so the IR is never incomplete — it gracefully degrades.
+
+Q11: What are the 14 Instruction kinds and why so many?
+A:  ASSIGN (x=e), DECL_ASSIGN (int x=e), DECL_ONLY (int x;), COND (if/while
+    conditions), FUNC_CALL_STMT (standalone calls), RETURN_STMT, ENTRY/EXIT
+    markers, SWITCH_EXPR, CASE_LABEL, DEFAULT_LABEL, LABEL_MARKER (goto
+    targets), BRANCH_PRUNED (optimizer artifact), FOR_NEXT (loop increment).
+    Each models a distinct C construct to enable precise analysis.
+
+================================================================================
+SECTION 3: CFG CONSTRUCTION (cfg.h, cfg_builder.h)
+================================================================================
+
+Q12: How does the CFGBuilder handle if/else?
+A:  1. Add COND instruction to current block (becomes the condition block).
+    2. Create a "then" block, edge from cond→then, visit then-body.
+    3. If else exists: create "else" block, edge from cond→else, visit else-body.
+    4. Create merge block. Edge from end-of-then→merge, end-of-else→merge.
+    5. If no else: edge from cond→merge (false path).
+
+Q13: How are while loops represented in the CFG?
+A:  1. Create header block with WHILE_COND instruction.
+    2. Edge from current→header.
+    3. Create body block, edge header→body (true path).
+    4. After body: edge back to header (BACK EDGE).
+    5. Create exit block, edge header→exit (false path).
+    6. Push exit onto breakTargets, header onto continueTargets.
+
+Q14: How do you handle break and continue?
+A:  Using two stacks: breakTargets and continueTargets. When entering a loop,
+    we push the exit block (break target) and the header/increment block
+    (continue target). On break: edge to breakTargets.back(). On continue:
+    edge to continueTargets.back(). Then create a dead block (code after
+    break/continue is unreachable).
+
+Q15: How does goto/label work?
+A:  Two-pass approach. On visiting goto: record (currentBlock, labelName) in
+    pendingGotos, create dead block. On visiting label: create new block,
+    record in labels map. After full traversal: resolve all pending gotos
+    by adding edges from source block to label block.
+
+Q16: What is a "dead block" and why create one after return/break/continue/goto?
+A:  Code after these statements is unreachable. We create a fresh block so
+    any subsequent statements are placed there (they won't have incoming edges).
+    The unreachable code removal pass later deletes these blocks.
+
+Q17: How is switch/case handled?
+A:  The switch expression block gets edges to each case/default block. Each
+    case block gets an edge from the previous case's end (fall-through) if
+    the previous case wasn't terminated. Break edges go to the switch exit.
+
+Q18: What does convertExpr() do?
+A:  Converts a Clang Expr* into our IR ExprPtr. It pattern-matches on the
+    Clang node type (IntegerLiteral→CONST_INT, DeclRefExpr→VAR,
+    BinaryOperator→BINOP, CallExpr→FUNC_CALL, etc.) and recursively
+    converts sub-expressions. Falls back to UNKNOWN with pretty-printed text.
+
+Q19: Why call IgnoreImpCasts() and IgnoreParens()?
+A:  Clang wraps expressions in implicit cast nodes (e.g., integer promotion)
+    and parenthesis nodes. We strip these to get the "real" expression
+    underneath, making our IR cleaner and analysis simpler.
+
+================================================================================
+SECTION 4: DATAFLOW ANALYSIS (dataflow.h)
+================================================================================
+
+Q20: What is dataflow analysis?
+A:  A framework for computing information about program state at each point
+    by propagating facts along CFG edges until a fixed point is reached.
+    Each analysis has a direction (forward/backward), a meet operator
+    (union/intersection), and a transfer function.
+
+Q21: Explain Reaching Definitions Analysis.
+A:  For every point in the program, which assignments (definitions) could
+    possibly reach that point without being overwritten.
+    Direction: Forward. Meet: Union. 
+    Transfer: OUT[B] = GEN[B] ∪ (IN[B] − KILL[B])
+    GEN[B] = definitions created in B.
+    KILL[B] = definitions from other blocks that define the same variable.
+
+Q22: What is a "Definition" in your implementation?
+A:  A tuple (variable_name, block_id, statement_index). This uniquely
+    identifies where a variable was assigned. For example, ("x", 2, 0) means
+    variable x was defined in block 2, instruction 0.
+
+Q23: Explain Live Variable Analysis.
+A:  Determines whether a variable's current value might be used before it's
+    next reassigned. If not, the variable is "dead" at that point.
+    Direction: Backward. Meet: Union.
+    Transfer: IN[B] = USE[B] ∪ (OUT[B] − DEF[B])
+
+Q24: Why is Reaching Definitions forward and Live Variables backward?
+A:  Reaching Definitions asks "what can reach here from the past?" — info
+    flows forward along execution. Live Variables asks "will this be used
+    in the future?" — info flows backward from uses to definitions.
+
+Q25: What does "iterative fixed-point" mean?
+A:  We repeatedly apply transfer functions to all blocks until no set changes.
+    Convergence is guaranteed because: (1) sets only grow (union meet), and
+    (2) the domain is finite (finite variables/definitions).
+
+Q26: Why compute USE before DEF in Live Variable Analysis?
+A:  A variable that is used BEFORE being defined in a block is "upward exposed"
+    — it needs a value from outside the block. If we added it to DEF first,
+    we'd incorrectly mask this use.
+
+Q27: What's the difference between GEN/KILL (Reaching Defs) and USE/DEF (Live Vars)?
+A:  GEN/KILL operate on definitions (tuples). GEN = defs created in block.
+    KILL = defs from elsewhere killed by redefinition.
+    USE/DEF operate on variable names. USE = vars read before written.
+    DEF = vars written before read.
+
+================================================================================
+SECTION 5: OPTIMIZATIONS (optimizer.h)
+================================================================================
+
+Q28: What is Constant Folding?
+A:  Evaluating expressions with known constant operands at compile time.
+    Example: x = 3 + 5 → x = 8. Our implementation handles 17+ binary
+    operators and 3 unary operators recursively.
+
+Q29: What is Constant Propagation?
+A:  When a variable has a known constant value, replace all subsequent uses
+    of that variable with the constant. Example: if x=10, then y=x+5
+    becomes y=10+5 (which constant folding then reduces to y=15).
+
+Q30: How do folding and propagation work together?
+A:  Propagation replaces variables with constants, creating new opportunities
+    for folding. Folding simplifies expressions, potentially enabling more
+    propagation. Running them iteratively maximizes the benefit.
+
+Q31: What is Branch Pruning?
+A:  When a condition folds to a constant (e.g., if(0)), we know which branch
+    is always taken. We remove the dead branch's edge from the CFG and
+    replace the COND instruction with BRANCH_PRUNED. This makes the dead
+    branch unreachable for the next pass.
+
+Q32: How does Dead Code Elimination (DCE) work?
+A:  1. Run live variable analysis to get live-out sets per block.
+    2. Walk instructions in REVERSE within each block.
+    3. If a variable is assigned but NOT in the live-out set, and the RHS
+       has no side effects (not a function call), delete the instruction.
+    4. Update the live set as we go (remove defs, add uses).
+
+Q33: Why walk instructions in reverse for DCE?
+A:  Because liveness flows backward. Starting from the end with the known
+    live-out set, we can accurately determine at each instruction whether
+    the assigned variable will be used later in the block.
+
+Q34: Why skip function calls in DCE?
+A:  Function calls may have side effects (I/O, modifying global state).
+    Even if the return value is unused, the call itself is meaningful.
+    Example: printf("hello") — assigned to _ but must not be removed.
+
+Q35: How does Unreachable Code Removal work?
+A:  Simple BFS from the entry block. Any block not visited is unreachable
+    (no path from function entry). Delete those blocks and clean up edges.
+
+Q36: What is Empty Block Merging?
+A:  After optimization, some blocks may have no real instructions (only
+    BRANCH_PRUNED markers). If such a block has one successor, we rewire
+    its predecessors to point directly to the successor and delete the block.
+
+Q37: Why run all passes iteratively (up to 20 times)?
+A:  Each pass can create opportunities for other passes. Example:
+    Propagation → Folding → Branch Pruning → Unreachable Removal → DCE.
+    A single pass isn't enough. We iterate until no pass reports changes.
+
+Q38: Why cap at 20 iterations?
+A:  Safety against infinite loops. In practice, convergence happens in 2-4
+    iterations. The cap prevents pathological cases from hanging.
+
+================================================================================
+SECTION 6: TAINT ANALYSIS (advanced.h)
+================================================================================
+
+Q39: What is Taint Analysis?
+A:  A security analysis that tracks "untrusted" (tainted) data from input
+    sources through the program. If tainted data reaches a dangerous
+    function (sink) without sanitization, it's a potential vulnerability.
+
+Q40: What are sources and sinks in your implementation?
+A:  Sources: scanf, gets, read, fgets, getchar, getenv — functions that
+    read external/user input.
+    Sinks: system, printf, exec, execve, popen, sprintf — functions where
+    tainted data could cause injection attacks or information leaks.
+
+Q41: How does taint propagate?
+A:  1. Direct: x = scanf() → x is tainted.
+    2. Through assignment: if y is tainted and z = y + 1, then z is tainted.
+    3. Through arguments: scanf("%d", &x) → x is tainted (address-of pattern).
+    Rule: if ANY used variable in an assignment's RHS is tainted, the LHS
+    becomes tainted.
+
+Q42: Give a concrete taint flow example from test_input.c.
+A:  scanf("%d", &user_input) → user_input TAINTED
+    cmd_val = user_input + 50 → cmd_val TAINTED (uses tainted var)
+    sprintf(buf, "echo %d", cmd_val) → WARNING: cmd_val reaches sink sprintf
+    system(buf) → WARNING: buf reaches sink system
+
+Q43: What kind of vulnerabilities does taint analysis detect?
+A:  Command injection (system with user input), format string attacks
+    (printf with user-controlled format), buffer overflows (sprintf),
+    code execution (exec/popen with tainted args).
+
+Q44: What are the limitations of your taint analysis?
+A:  - Intra-procedural only (doesn't track across function calls)
+    - No sanitization detection (can't recognize input validation)
+    - No path sensitivity (doesn't consider which branches are taken)
+    - Single-pass BFS (may miss some propagation in loops)
+    - Over-approximation: may report false positives
+
+================================================================================
+SECTION 7: LOOP DETECTION & LICM (advanced.h)
+================================================================================
+
+Q45: What is a Dominator?
+A:  Node A dominates node B if every path from ENTRY to B must pass through A.
+    The entry block dominates all reachable blocks.
+
+Q46: How do you compute dominators?
+A:  Iterative fixed-point algorithm:
+    Dom(entry) = {entry}
+    Dom(N) = {N} ∪ (∩ Dom(P) for all predecessors P of N)
+    Initialize all nodes' dominator sets to the set of all nodes.
+    Iterate until no set changes.
+
+Q47: What is a back-edge and how does it identify loops?
+A:  A back-edge is an edge N→H where H dominates N. This means we're
+    jumping "backward" in the dominator tree — which creates a cycle,
+    i.e., a loop. H is the loop header.
+
+Q48: What is a Natural Loop?
+A:  Given a back-edge N→H, the natural loop is the set of all nodes that
+    can reach N without going through H (plus H itself). Computed by
+    backward worklist from N.
+
+Q49: What is Loop-Invariant Code Motion (LICM)?
+A:  Moving computations that produce the same result on every loop iteration
+    to just before the loop. An instruction is loop-invariant if ALL its
+    operand variables are defined OUTSIDE the loop body.
+
+Q50: Give an example of LICM from test_input.c.
+A:  In the for-loop: factor = multiplier + x. Both "multiplier" and "x" are
+    defined before the loop and never modified inside it. So this assignment
+    computes the same value every iteration and can be hoisted before the loop.
+
+================================================================================
+SECTION 8: CLANG TOOLING & BUILD SYSTEM
+================================================================================
+
+Q51: How does Clang Tooling work?
+A:  ClangTool takes a compilation database and source paths. It runs a
+    FrontendAction on each file, which creates an ASTConsumer. The consumer's
+    HandleTranslationUnit gets the complete AST for the file.
+
+Q52: What is an ASTConsumer and ASTFrontendAction?
+A:  ASTFrontendAction is the entry point — Clang calls CreateASTConsumer()
+    to get a consumer for each source file. The ASTConsumer receives
+    callbacks as the AST is built. We override HandleTranslationUnit to
+    process the complete AST.
+
+Q53: Why filter system headers?
+A:  System headers (#include <stdio.h>) contain internal helper functions
+    (like __bswap_16) that are not user code. We use SM.isInSystemHeader()
+    and skip "__"-prefixed names to only process user-defined functions.
+
+Q54: What does the "--" argument mean when running cfg_tool?
+A:  It tells Clang Tooling that there are no extra compiler flags. Without it,
+    Clang might look for a compile_commands.json or fail to parse arguments.
+
+Q55: What is CMake doing in CMakeLists.txt?
+A:  Finding LLVM and Clang packages (headers + libraries), setting C++17,
+    defining the cfg_tool executable, and linking against clang-cpp and LLVM.
+    On Windows, it also links version.lib.
+
+================================================================================
+SECTION 9: DOT EXPORT & VISUALIZATION
+================================================================================
+
+Q56: What is the DOT format?
+A:  A plain-text graph description language used by Graphviz. Nodes are
+    defined with labels and attributes; edges with arrows. We generate
+    styled DOT with colors, fonts, and True/False edge labels.
+
+Q57: How do you distinguish branch edges in the DOT output?
+A:  If a block has a COND instruction with exactly 2 successors, the first
+    edge is labeled "True" (green) and the second "False" (red).
+
+================================================================================
+SECTION 10: COMPARATIVE QUESTIONS (Python vs C++)
+================================================================================
+
+Q58: What are the key differences between the Python and C++ implementations?
+A:  Python uses pycparser (Option B), C++ uses Clang (Option A).
+    Python works directly on pycparser AST nodes; C++ converts to custom IR.
+    C++ needs explicit memory management (shared_ptr); Python has GC.
+    C++ compiles to native binary (fast); Python is interpreted.
+    Both implement identical analysis algorithms and optimization passes.
+
+Q59: Why have both implementations?
+A:  Python for rapid prototyping and a Streamlit dashboard. C++ for
+    production correctness with Clang's full C support. The C++ version
+    handles real-world C code that pycparser cannot parse.
+
+================================================================================
+SECTION 11: THEORY & CONCEPTUAL QUESTIONS
+================================================================================
+
+Q60: What is the difference between a CFG and a Call Graph?
+A:  A CFG represents control flow WITHIN a single function (blocks and
+    branches). A Call Graph represents which functions call which other
+    functions (inter-procedural).
+
+Q61: What properties must a sound dataflow analysis have?
+A:  Monotonicity (transfer function preserves partial order), finite
+    lattice height (guarantees termination), and correct transfer functions
+    (model actual program semantics).
+
+Q62: What is the difference between may-analysis and must-analysis?
+A:  May-analysis: "this MIGHT be true" (over-approximation, uses union).
+    Must-analysis: "this MUST be true" (under-approximation, uses intersection).
+    Reaching Defs and Live Vars are both may-analyses (union meet).
+
+Q63: Can constant propagation be inter-procedural?
+A:  In our implementation, no — it's intra-block only. Inter-procedural
+    constant propagation would require a call graph and summary information
+    for each function. This is significantly more complex.
+
+Q64: What makes DCE "safe"?
+A:  We only remove assignments where: (1) the variable is not live-out,
+    (2) the RHS has no side effects. This guarantees the program's
+    observable behavior is unchanged.
+
+Q65: What is the relationship between dominator trees and SSA form?
+A:  Dominator trees define where phi-functions are placed in SSA form.
+    The dominance frontier of a node N is where phi-functions for variables
+    defined in N must be inserted. Our project uses dominators for loop
+    detection, not SSA construction.
+
+================================================================================
+SECTION 12: EDGE CASES & ERROR HANDLING
+================================================================================
+
+Q66: What happens with division by zero in constant folding?
+A:  The foldExpr function checks if the divisor is zero. If so, it sets
+    valid=false and skips the fold, leaving the expression unchanged.
+
+Q67: How do you handle infinite loops (while(1))?
+A:  The condition "1" is a non-zero constant. Branch pruning removes the
+    false exit edge. The loop becomes an infinite loop in the CFG (only
+    break/return can exit). This is correct behavior.
+
+Q68: What if a goto jumps to a label that hasn't been seen yet?
+A:  The two-pass approach handles this. During AST traversal, gotos are
+    recorded in pendingGotos. After the full function body is visited, all
+    labels are known, and pendingGotos are resolved.
+
+Q69: What if the C code has syntax errors?
+A:  Clang handles parsing and reports errors via stderr. The tool's return
+    code will be non-zero, and the dashboard shows the error. Our code
+    never sees an invalid AST.
+
+Q70: How does the optimizer handle functions with no optimizable code?
+A:  All six passes return false (no changes). The log stays empty, and the
+    console prints "(no optimizations applied)". The before and after DOT
+    files will be identical.
+
+================================================================================
+END OF VIVA QUESTIONS
+================================================================================

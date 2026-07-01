@@ -1,0 +1,11 @@
+digraph "assume_abort_if_not" {
+  node [shape=box, style="filled,rounded", fontname="Courier New", fontsize=10];
+  edge [fontname="Courier New", fontsize=9];
+
+  0 [label="Block 0\nENTRY\nIF_COND: !cond\n", fillcolor="#d4edda", color="#28a745"];
+  0 -> 2 [label="True", color="#28a745", fontcolor="#28a745"];
+  0 -> 1 [label="False", color="#dc3545", fontcolor="#dc3545"];
+  1 [label="Block 1\nEXIT\n", fillcolor="#f8d7da", color="#dc3545"];
+  2 [label="Block 2\nabort()\n", fillcolor="#e2e3e5", color="#6c757d"];
+  2 -> 1;
+}

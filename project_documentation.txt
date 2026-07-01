@@ -1,0 +1,463 @@
+================================================================================
+  C CODE → OPTIMIZED CFG PIPELINE — C++ IMPLEMENTATION
+  COMPLETE PROJECT DOCUMENTATION
+================================================================================
+
+TABLE OF CONTENTS
+─────────────────
+  1.  Project Overview
+  2.  File-by-File Dependency Graph (ASCII)
+  3.  Data Flow Through the Pipeline
+  4.  File Descriptions & Code Evolution
+  5.  Key Data Structures
+  6.  Algorithm Details
+  7.  Build System & Toolchain
+  8.  Dashboard Integration (cpp_app.py)
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+This project implements a complete compiler analysis pipeline that:
+  • Parses raw C source code using the LLVM/Clang frontend (Option A)
+  • Constructs a Control Flow Graph (CFG) with basic blocks
+  • Performs static dataflow analysis (Reaching Definitions + Live Variables)
+  • Applies 6 iterative optimization passes
+  • Runs security taint analysis, loop detection, and LICM suggestions
+  • Exports styled Graphviz DOT files for visualization
+  • Provides a Streamlit web dashboard for interactive use
+
+Target: C17 source files.  Implementation: C++17 with LLVM/Clang libraries.
+
+================================================================================
+2. FILE DEPENDENCY GRAPH
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                        main.cpp (DRIVER)                       │
+  │  Orchestrates the full pipeline for each user-defined function │
+  └──────┬──────────┬───────────┬───────────┬───────────┬──────────┘
+         │          │           │           │           │
+         v          v           v           v           v
+   cfg_builder.h  dataflow.h  optimizer.h  advanced.h  dot_export.h
+         │          │           │           │           │
+         v          │           │           │           │
+       cfg.h ◄──────┘───────────┘───────────┘───────────┘
+         │
+         v
+       ir.h  (leaf — no dependencies beyond STL)
+
+  Build:
+    CMakeLists.txt ──► cfg_tool executable (links clang-cpp + LLVM)
+
+  Dashboard:
+    cpp_app.py ──► subprocess call to cfg_tool ──► parses stdout + .dot files
+
+  INCLUDE CHAIN (bottom-up):
+  ─────────────────────────────────────────────────────
+    ir.h          → <string>, <vector>, <set>, <memory>, <sstream>
+    cfg.h         → ir.h, <map>, <algorithm>, <queue>
+    cfg_builder.h → cfg.h, <clang/AST/*>, <llvm/Support/*>, <stack>
+    dataflow.h    → cfg.h, <tuple>
+    optimizer.h   → cfg.h, dataflow.h
+    advanced.h    → cfg.h, dataflow.h
+    dot_export.h  → cfg.h, <fstream>
+    main.cpp      → cfg_builder.h, dataflow.h, optimizer.h, advanced.h,
+                     dot_export.h, <clang/Frontend/*>, <clang/Tooling/*>
+
+================================================================================
+3. DATA FLOW THROUGH THE PIPELINE
+================================================================================
+
+  C Source File (.c)
+        │
+        ▼
+  ┌──────────────┐
+  │ Clang Tooling│  ClangTool + CommonOptionsParser
+  │  (main.cpp)  │  Parses file, builds Clang AST
+  └──────┬───────┘
+         │  Clang AST (FunctionDecl → CompoundStmt → ...)
+         ▼
+  ┌──────────────┐
+  │  CFGBuilder  │  cfg_builder.h
+  │              │  Walks Clang AST recursively
+  │              │  Converts Clang Expr → IR Expr (convertExpr)
+  │              │  Creates BasicBlocks, wires edges
+  │              │  Handles if/else/while/for/do/switch/goto/label
+  └──────┬───────┘
+         │  CFG object (map<int,BasicBlock>, entryId, exitId)
+         ▼
+  ┌──────────────┐
+  │ DOTExporter  │  dot_export.h — exports <func>_before.dot
+  └──────────────┘
+         │
+         ▼
+  ┌──────────────┐
+  │DataFlowAnalys│  dataflow.h
+  │  is          │
+  │  • Reaching  │  Forward iterative fixed-point
+  │    Defs      │  GEN/KILL sets → IN/OUT per block
+  │  • Live Vars │  Backward iterative fixed-point
+  │              │  USE/DEF sets → IN/OUT per block
+  └──────┬───────┘
+         │  ReachingResult, LiveResult
+         ▼
+  ┌──────────────┐
+  │  Optimizer   │  optimizer.h
+  │  1.ConstFold │  Recursive expr folding (17+ ops)
+  │  2.ConstProp │  Intra-block var→const substitution
+  │  3.BranchPrn │  Prune dead edges on const conditions
+  │  4.Unreach   │  BFS from entry, delete unreached blocks
+  │  5.DCE       │  Uses LiveResult, removes dead assigns
+  │  6.EmptyMrge │  Rewire predecessors past empty blocks
+  │  (iterative  │  Repeats 1-6 until no changes, max 20)
+  └──────┬───────┘
+         │  Mutated CFG
+         ▼
+  ┌──────────────┐
+  │ DOTExporter  │  exports <func>_after.dot
+  └──────────────┘
+         │
+         ▼
+  ┌──────────────┐
+  │SecurityScanr │  advanced.h — Taint Analysis
+  │  • BFS from  │  Sources: scanf, gets, read, fgets, getchar, getenv
+  │    entry     │  Sinks: system, printf, exec, execve, popen, sprintf
+  │  • Track     │  Propagation: if RHS uses tainted var → LHS tainted
+  │    taint     │  Warning: tainted var reaches sink argument
+  └──────────────┘
+         │
+         ▼
+  ┌──────────────┐
+  │LoopDetector  │  advanced.h
+  │  • Dominator │  Iterative fixed-point (Allen & Cocke, 1970)
+  │    Trees     │  Dom(entry)={entry}, Dom(N)={N}∪(∩Dom(P))
+  │  • Back-edge │  Edge N→H where H ∈ Dom(N)
+  │    detection │
+  │  • Natural   │  Collect nodes reaching back-node w/o header
+  │    loop body │
+  │  • LICM      │  Assignment uses only loop-external vars
+  └──────────────┘
+         │
+         ▼
+  Console Output (structured text, parsed by cpp_app.py)
+
+================================================================================
+4. FILE DESCRIPTIONS & CODE EVOLUTION
+================================================================================
+
+──────────────────────────────────────────────
+4.1  ir.h — Intermediate Representation (261 lines)
+──────────────────────────────────────────────
+PURPOSE: Lightweight IR that decouples later passes from the Clang AST.
+         The Python version works directly on pycparser AST nodes; in C++
+         we convert to this IR during CFG construction.
+
+KEY TYPES:
+  struct Expr
+    • Variant-style node: CONST_INT | VAR | BINOP | UNARYOP | FUNC_CALL | UNKNOWN
+    • Factory methods: makeConst, makeVar, makeBinOp, makeUnaryOp, makeCall, makeUnknown
+    • Queries: isConst(), isVar(), isCall()
+    • Utilities: getUsedVars() — recursive var collection
+                 toString()    — pretty printing
+                 clone()       — deep copy
+
+  struct Instruction
+    • 14 kinds: ASSIGN, DECL_ASSIGN, DECL_ONLY, COND, FUNC_CALL_STMT,
+      RETURN_STMT, ENTRY_MARKER, EXIT_MARKER, SWITCH_EXPR, CASE_LABEL,
+      DEFAULT_LABEL, LABEL_MARKER, BRANCH_PRUNED, FOR_NEXT
+    • getDefs() → variables defined (only ASSIGN/DECL_ASSIGN)
+    • getUses() → variables used (depends on kind)
+    • Factory methods for each kind
+
+DESIGN DECISIONS:
+  • shared_ptr<Expr> for tree-structured expressions (enables sharing & cloning)
+  • Flat enum for Instruction::Kind instead of inheritance (simpler, cache-friendly)
+  • "UNKNOWN" fallback for unsupported expressions (graceful degradation)
+
+──────────────────────────────────────────────
+4.2  cfg.h — CFG Data Structures (119 lines)
+──────────────────────────────────────────────
+PURPOSE: Core graph representation — nodes (BasicBlock) and edges.
+
+KEY TYPES:
+  struct BasicBlock
+    • id: int — unique block identifier
+    • instructions: vector<Instruction>
+    • successors, predecessors: vector<int>
+
+  class CFG
+    • name: string — function name
+    • blocks: map<int, BasicBlock> — ordered by ID
+    • entryId, exitId: int — sentinel blocks
+    • createBlock() — allocates new block with next ID
+    • addEdge(from, to) — adds bidirectional edge (checks duplicates)
+    • removeBlock(id) — cleans up all edge references
+    • isTerminated(id) — checks if block has outgoing edges / return
+    • stats() — counts blocks, edges, statements
+
+DESIGN DECISIONS:
+  • map<int,BasicBlock> instead of vector — blocks can be deleted mid-pipeline
+  • Bidirectional edges (successors + predecessors) — needed for backward analysis
+  • Duplicate-edge prevention in addEdge
+
+──────────────────────────────────────────────
+4.3  cfg_builder.h — Clang AST → CFG (526 lines)
+──────────────────────────────────────────────
+PURPOSE: The heart of Phase 1.  Walks the Clang AST and builds the CFG.
+
+TOP-LEVEL FLOW:
+  1. CFGBuilder(funcName) — creates ENTRY and EXIT blocks
+  2. build(body) — calls visitStmt, links final block → EXIT, resolves gotos
+  3. Returns completed CFG via move semantics
+
+CLANG EXPR → IR EXPR (convertExpr function):
+  Handles: IntegerLiteral, CharacterLiteral, DeclRefExpr, BinaryOperator,
+           UnaryOperator, CallExpr, StringLiteral, CompoundAssignOperator,
+           ArraySubscriptExpr, ConditionalOperator
+  Fallback: clangExprStr() pretty-prints unknown exprs as UNKNOWN nodes
+
+STATEMENT DISPATCH (visitStmt):
+  CompoundStmt → visitCompound (iterate children)
+  IfStmt       → visitIf       (cond block → true/false → merge)
+  WhileStmt    → visitWhile    (header → body → back-edge → exit)
+  ForStmt      → visitFor      (init → header → body → incr → back-edge → exit)
+  DoStmt       → visitDoWhile  (body → cond → back-edge/exit)
+  SwitchStmt   → visitSwitch   (switch block → case blocks → fall-through → exit)
+  BreakStmt    → visitBreak    (edge to breakTargets.back(), dead block)
+  ContinueStmt → visitContinue (edge to continueTargets.back(), dead block)
+  ReturnStmt   → visitReturn   (edge to EXIT, dead block)
+  GotoStmt     → visitGoto     (pending resolution, dead block)
+  LabelStmt    → visitLabel    (new block, record in labels map)
+  DeclStmt     → visitDecl     (DECL_ASSIGN or DECL_ONLY)
+  Expr         → visitExprStmt (assignment / call / increment / fallback)
+
+CONTROL FLOW PATTERNS:
+  • Break/continue: stack-based targets (breakTargets, continueTargets)
+  • Goto/label: two-pass — pendingGotos collected, resolved after full traversal
+  • Dead blocks: created after return/break/continue/goto for unreachable code
+
+──────────────────────────────────────────────
+4.4  dataflow.h — Dataflow Analysis (183 lines)
+──────────────────────────────────────────────
+PURPOSE: Phase 2 — two classic dataflow analyses.
+
+REACHING DEFINITIONS (forward, union):
+  Definition = tuple<varName, blockId, stmtIndex>
+  GEN[B]  = definitions generated in block B
+  KILL[B] = definitions from OTHER blocks that define the same variables
+  Transfer: OUT[B] = GEN[B] ∪ (IN[B] − KILL[B])
+  Meet:     IN[B]  = ∪ OUT[P] for all predecessors P
+  Fixed-point: iterate until no OUT set changes
+
+LIVE VARIABLE ANALYSIS (backward, union):
+  USE[B] = variables used before any def in block B
+  DEF[B] = variables defined before any use in block B
+  Transfer: IN[B]  = USE[B] ∪ (OUT[B] − DEF[B])
+  Meet:     OUT[B] = ∪ IN[S] for all successors S
+  Fixed-point: iterate in reverse block order until no IN set changes
+
+──────────────────────────────────────────────
+4.5  optimizer.h — Optimization Passes (381 lines)
+──────────────────────────────────────────────
+PURPOSE: Phase 3 — six optimization passes, run iteratively.
+
+PASS 1: CONSTANT FOLDING (constantFolding)
+  Recursive foldExpr traversal of expression trees.
+  Supports 17+ operators: +, -, *, /, %, <, >, <=, >=, ==, !=, &&, ||,
+                           &, |, ^, <<, >>
+  Unary: -, !, ~
+  Division by zero guarded (skips fold).
+
+PASS 2: CONSTANT PROPAGATION (constantPropagation)
+  Intra-block map<string,int> tracks known constants.
+  propagateInExpr replaces VAR nodes with CONST_INT.
+  When a variable is assigned a non-constant, it's erased from the map.
+
+PASS 3: BRANCH PRUNING (pruneConstantBranches)
+  If a COND instruction has a const condition and exactly 2 successors:
+    val==0 → remove true branch edge
+    val!=0 → remove false branch edge
+  Replaces COND with BRANCH_PRUNED marker.
+
+PASS 4: UNREACHABLE CODE REMOVAL (eliminateUnreachable)
+  BFS from entry. Any block not reached is deleted via cfg.removeBlock().
+
+PASS 5: DEAD CODE ELIMINATION (deadCodeElimination)
+  Runs live variable analysis. Walks instructions in reverse.
+  If assignment's LHS is not in live-out set and RHS has no side effects
+  (not a function call), the assignment is removed.
+
+PASS 6: EMPTY BLOCK MERGING (mergeEmptyBlocks)
+  Blocks with no real statements (only BRANCH_PRUNED) and exactly 1 successor
+  are merged: predecessors are rewired to the successor.
+
+ITERATION: optimize() runs passes 1-6 in order. If ANY pass returns true
+  (changed), the loop repeats. Maximum 20 iterations.
+
+──────────────────────────────────────────────
+4.6  advanced.h — Bonus Features (353 lines)
+──────────────────────────────────────────────
+PURPOSE: Taint analysis, dominator trees, loop detection, LICM.
+
+SECURITY SCANNER (Taint Analysis):
+  Sources: {scanf, gets, read, fgets, getchar, getenv}
+  Sinks:   {system, printf, exec, execve, popen, sprintf}
+  Algorithm:
+    1. BFS from entry block
+    2. For each statement:
+       - If standalone call to source → mark args tainted
+         (handles &x pattern for scanf, direct var for gets)
+       - If assignment with RHS call to source → LHS tainted
+       - If assignment and any used var is tainted → LHS tainted
+       - If call to sink and any arg uses tainted var → WARNING
+  Output: list of warnings + map<string,bool> of tainted variables
+
+LOOP DETECTOR (Dominator Trees):
+  Algorithm: Iterative fixed-point (Allen & Cocke, 1970)
+    Dom(entry) = {entry}
+    Dom(N) = {N} ∪ (∩ Dom(P) for reachable predecessors P)
+  Back-edge: N→H where H ∈ Dom(N)
+  Natural loop body: all nodes that can reach back-node without going
+    through the header (backward worklist from back-node)
+
+LICM SUGGESTIONS:
+  For each loop body, gather all defined variables (loopDefs).
+  An assignment is loop-invariant if ALL its used variables are NOT in loopDefs.
+  Reports: variable name, block, suggestion to move before header.
+
+──────────────────────────────────────────────
+4.7  dot_export.h — Graphviz Export (91 lines)
+──────────────────────────────────────────────
+PURPOSE: Converts CFG to styled Graphviz DOT format.
+
+STYLING:
+  • Entry block: green fill (#d4edda), green border (#28a745)
+  • Exit block:  red fill (#f8d7da), red border (#dc3545)
+  • Other blocks: grey fill (#e2e3e5), grey border (#6c757d)
+  • Branch edges: True=green, False=red with labels
+  • Font: Courier New, size 10 (nodes), 9 (edges)
+  • Shape: box, rounded corners
+
+──────────────────────────────────────────────
+4.8  main.cpp — Pipeline Driver (269 lines)
+──────────────────────────────────────────────
+PURPOSE: Entry point. Uses Clang Tooling to parse C files and run the pipeline.
+
+CLANG INTEGRATION:
+  • CFGPipelineAction : ASTFrontendAction — creates consumer
+  • CFGPipelineConsumer : ASTConsumer — HandleTranslationUnit
+  • Filters: skips system headers (SM.isInSystemHeader) and __-prefixed builtins
+  • Uses CommonOptionsParser for command-line arg handling
+
+PER-FUNCTION PIPELINE:
+  1. Build CFG (CFGBuilder)
+  2. Export before.dot
+  3. Run Reaching Definitions + print IN/OUT per block
+  4. Run Live Variables + print IN/OUT per block
+  5. Run Optimizer (6 passes iteratively) + print log
+  6. Export after.dot
+  7. Run SecurityScanner + print warnings + tainted vars
+  8. Run LoopDetector + print loops + dominator sets + LICM candidates
+
+──────────────────────────────────────────────
+4.9  CMakeLists.txt — Build Configuration (49 lines)
+──────────────────────────────────────────────
+  • C++17 required
+  • find_package(LLVM) + find_package(Clang)
+  • Links: clang-cpp, LLVM
+  • Windows: links version.lib, defines _CRT_SECURE_NO_WARNINGS
+  • Exports compile_commands.json
+
+──────────────────────────────────────────────
+4.10 cpp_app.py — Streamlit Dashboard (379 lines)
+──────────────────────────────────────────────
+PURPOSE: Web UI that calls cfg_tool via subprocess and displays results.
+
+FLOW:
+  1. User pastes C code or loads test case
+  2. Writes temp_input.c, runs: wsl ./build/cfg_tool temp_input.c --
+  3. parse_cpp_output() extracts structured data from stdout via regex
+  4. Displays: Original CFG, Loop Detection, Taint Analysis,
+     Reaching Defs, Live Vars, Optimization metrics, Optimized CFG
+  5. Download button for optimized DOT file
+
+──────────────────────────────────────────────
+4.11 test_input.c — Test File (78 lines)
+──────────────────────────────────────────────
+Exercises ALL pipeline features:
+  • Constant folding:    int x = 3 + 5;
+  • Constant propagation: int y = x * 2;
+  • Dead code:           int z = 100; (never used)
+  • Taint source:        scanf("%d", &user_input);
+  • If/else, while, for, do-while, switch/case/default
+  • LICM candidate:      factor = multiplier + x inside for-loop
+  • Taint sink:          system(buf) with tainted data
+  • Goto/label:          goto skip; int unreachable = 999; skip:
+
+================================================================================
+5. KEY DATA STRUCTURES
+================================================================================
+
+  Expr (shared_ptr)
+  ├── CONST_INT   { intVal }
+  ├── VAR         { varName }
+  ├── BINOP       { op, left, right }
+  ├── UNARYOP     { op, operand }
+  ├── FUNC_CALL   { funcName, args[] }
+  └── UNKNOWN     { raw string }
+
+  Instruction
+  ├── ASSIGN         { lhs, rhs }
+  ├── DECL_ASSIGN    { lhs, rhs }
+  ├── DECL_ONLY      { lhs }
+  ├── COND           { condTag, cond }
+  ├── FUNC_CALL_STMT { funcName, callArgs[] }
+  ├── RETURN_STMT    { retExpr }
+  ├── ENTRY_MARKER
+  ├── EXIT_MARKER
+  ├── SWITCH_EXPR    { switchExpr }
+  ├── CASE_LABEL     { caseExpr }
+  ├── DEFAULT_LABEL
+  ├── LABEL_MARKER   { labelName }
+  ├── BRANCH_PRUNED
+  └── FOR_NEXT       { nextExpr }
+
+  BasicBlock { id, instructions[], successors[], predecessors[] }
+
+  CFG { name, blocks: map<int,BasicBlock>, entryId, exitId }
+
+  Definition = tuple<string, int, int>  (var, blockId, stmtIndex)
+
+================================================================================
+6. ALGORITHM COMPLEXITY
+================================================================================
+
+  Reaching Definitions:  O(V × E × D) where D = number of definitions
+  Live Variables:        O(V × E)
+  Constant Folding:      O(N) per pass where N = total instructions
+  Unreachable Removal:   O(V + E) — single BFS
+  Dominator Computation: O(V²) iterative
+  Taint Analysis:        O(V + E) — single BFS pass
+
+  Overall pipeline:      O(iterations × (V×E×D + V×E + V²))
+                         Bounded by max 20 iterations.
+
+================================================================================
+7. BUILD & RUN
+================================================================================
+
+  # Build (from cpp_impl/):
+  mkdir build && cd build
+  cmake .. -DLLVM_DIR=<path>/lib/cmake/llvm -DClang_DIR=<path>/lib/cmake/clang
+  cmake --build .
+
+  # Run:
+  ./cfg_tool test_input.c --
+
+  # Dashboard:
+  streamlit run cpp_app.py
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================

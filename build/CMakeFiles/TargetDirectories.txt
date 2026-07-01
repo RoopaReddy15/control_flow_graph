@@ -1,0 +1,8 @@
+/mnt/d/optimized_cfg/cpp_impl/build/CMakeFiles/intrinsics_gen.dir
+/mnt/d/optimized_cfg/cpp_impl/build/CMakeFiles/omp_gen.dir
+/mnt/d/optimized_cfg/cpp_impl/build/CMakeFiles/acc_gen.dir
+/mnt/d/optimized_cfg/cpp_impl/build/CMakeFiles/RISCVTargetParserTableGen.dir
+/mnt/d/optimized_cfg/cpp_impl/build/CMakeFiles/clang-tablegen-targets.dir
+/mnt/d/optimized_cfg/cpp_impl/build/CMakeFiles/cfg_tool.dir
+/mnt/d/optimized_cfg/cpp_impl/build/CMakeFiles/edit_cache.dir
+/mnt/d/optimized_cfg/cpp_impl/build/CMakeFiles/rebuild_cache.dir

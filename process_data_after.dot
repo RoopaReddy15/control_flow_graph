@@ -1,0 +1,8 @@
+digraph "process_data" {
+  node [shape=box, style="filled,rounded", fontname="Courier New", fontsize=10];
+  edge [fontname="Courier New", fontsize=9];
+
+  0 [label="Block 0\nENTRY\nsystem(input)\n", fillcolor="#d4edda", color="#28a745"];
+  0 -> 1;
+  1 [label="Block 1\nEXIT\n", fillcolor="#f8d7da", color="#dc3545"];
+}
