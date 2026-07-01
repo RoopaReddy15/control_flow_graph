@@ -18,7 +18,6 @@ cpp_impl/
 ├── CMakeLists.txt             Build    CMake build configuration
 ├── test_input.c               Test     Comprehensive test file
 ├── project_documentation.txt  Docs     Full project documentation
-├── viva_questions.txt         Docs     70 Q&A for viva preparation
 └── README.md                  Docs     This file
 ```
 
@@ -148,4 +147,3 @@ Paste C code on the left → see Original CFG, Optimized CFG, analysis results, 
 ## Documentation
 
 - `project_documentation.txt` — Complete architecture, data flow, algorithms, file descriptions
-- `viva_questions.txt` — 70 Q&A pairs for project viva preparation
